@@ -1,0 +1,14 @@
+version: 0.2
+phases:
+  build:
+    commands:
+      - set -eu
+      - rm -f lambda.zip site.zip
+      - (cd lambda && zip -q ../lambda.zip handler.py)
+      - zip -qr site.zip site
+      - aws s3 cp lambda.zip "s3://${ARTIFACT_BUCKET}/rum-demo/lambda.zip"
+      - aws s3 cp site.zip "s3://${ARTIFACT_BUCKET}/rum-demo/site.zip"
+      - aws cloudformation deploy --stack-name "${APPLICATION_STACK_NAME}" --template-file infra/app.yaml --role-arn "${DEPLOYMENT_ROLE_ARN}" --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM --parameter-overrides "ArtifactBucket=${ARTIFACT_BUCKET}" "LambdaArtifactKey=rum-demo/lambda.zip" "SiteArtifactKey=rum-demo/site.zip" "SiteRevision=${CODEBUILD_RESOLVED_SOURCE_VERSION}"
+artifacts:
+  files:
+    - infra/app.yaml

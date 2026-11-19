@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private S3 static website with CloudFront and CloudWatch RUM instrumentation.
+Parameters:
+  ArtifactBucket:
+    Type: String
+    Description: Regional S3 bucket containing the packaged Lambda and site ZIP files.
+  LambdaArtifactKey:
+    Type: String
+    Default: rum-demo/lambda.zip
+  SiteArtifactKey:
+    Type: String
+    Default: rum-demo/site.zip
+  SiteRevision:
+    Type: String
+    Default: initial
+    Description: Change this value to republish the website artifact.
+Resources:
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+
+  RUMIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${AWS::StackName}-rum-identity-pool'
+      AllowUnauthenticatedIdentities: true
+
+  RUMGuestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-rum-guest'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Federated: cognito-identity.amazonaws.com}
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals: {cognito-identity.amazonaws.com:aud: !Ref RUMIdentityPool}
+              ForAnyValue:StringLike: {cognito-identity.amazonaws.com:amr: unauthenticated}
+      Policies:
+        - PolicyName: PublishRUMEvents
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: rum:PutRumEvents
+                Resource: !Sub 'arn:${AWS::Partition}:rum:${AWS::Region}:${AWS::AccountId}:appmonitor/${AWS::StackName}-website'
+
+  RUMIdentityPoolRoles:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref RUMIdentityPool
+      Roles:
+        unauthenticated: !GetAtt RUMGuestRole.Arn
+
+  RUMAppMonitor:
+    Type: AWS::RUM::AppMonitor
+    DependsOn: RUMIdentityPoolRoles
+    Properties:
+      Name: !Sub '${AWS::StackName}-website'
+      Domain: !GetAtt CloudFrontDistribution.DomainName
+      Platform: Web
+      AppMonitorConfiguration:
+        IdentityPoolId: !Ref RUMIdentityPool
+        GuestRoleArn: !GetAtt RUMGuestRole.Arn
+        AllowCookies: true
+        EnableXRay: false
+        SessionSampleRate: 1
+        Telemetries: [errors, performance, http]
+
+  RUMMonitorIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/cloudwatch-rum-demo/${AWS::StackName}/app-monitor-id'
+      Type: String
+      Value: !GetAtt RUMAppMonitor.Id
+      Description: !Sub 'CloudWatch RUM app monitor ID for ${AWS::StackName}'
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-s3-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} static RUM demo'
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        Origins:
+          - Id: WebsiteS3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: {OriginAccessIdentity: ''}
+        DefaultCacheBehavior:
+          TargetOriginId: WebsiteS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies: {Forward: none}
+        PriceClass: PriceClass_100
+        ViewerCertificate: {CloudFrontDefaultCertificate: true}
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+            Condition:
+              StringEquals: {AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'}
+
+  PublisherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-publisher'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Policies:
+        - PolicyName: PublishConfiguredSite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${LambdaArtifactKey}'
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${SiteArtifactKey}'
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource: [!GetAtt WebsiteBucket.Arn, !Sub '${WebsiteBucket.Arn}/*']
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cloudwatch-rum-demo/${AWS::StackName}/app-monitor-id'
+              - Effect: Allow
+                Action: [cloudfront:CreateInvalidation]
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  PublisherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-site-publisher'
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt PublisherRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+
+  PublishWebsite:
+    Type: Custom::PublishRUMWebsite
+    DependsOn: [WebsiteBucketPolicy, RUMMonitorIdParameter]
+    Properties:
+      ServiceToken: !GetAtt PublisherFunction.Arn
+      ArtifactBucket: !Ref ArtifactBucket
+      SiteArtifactKey: !Ref SiteArtifactKey
+      WebsiteBucket: !Ref WebsiteBucket
+      MonitorIdParameter: !Ref RUMMonitorIdParameter
+      IdentityPoolId: !Ref RUMIdentityPool
+      GuestRoleArn: !GetAtt RUMGuestRole.Arn
+      Region: !Ref AWS::Region
+      DistributionId: !Ref CloudFrontDistribution
+      Revision: !Ref SiteRevision
+
+Outputs:
+  WebsiteUrl:
+    Description: CloudFront website URL
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+  AppMonitorName:
+    Value: !Ref RUMAppMonitor
+  AppMonitorId:
+    Value: !GetAtt RUMAppMonitor.Id
+  MonitorIdParameter:
+    Value: !Ref RUMMonitorIdParameter
+  WebsiteBucketName:
+    Value: !Ref WebsiteBucket

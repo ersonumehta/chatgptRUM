@@ -1,0 +1,12 @@
+:root { color-scheme: light; font-family: Inter, system-ui, sans-serif; color: #14213d; background: #f5f7fb; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+header { background: #14213d; color: white; padding: 1.3rem max(1.5rem, calc((100% - 900px)/2)); }
+header strong { font-size: 1.1rem; }
+nav { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: .9rem; }
+nav a { color: #bde0fe; }
+main { max-width: 900px; margin: 3rem auto; padding: 0 1.5rem; }
+.card { background: white; border: 1px solid #e1e7f0; border-radius: 14px; padding: 1.5rem; box-shadow: 0 8px 26px #14213d0a; }
+.tag { color: #0077b6; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+footer { max-width: 900px; margin: 2rem auto; padding: 0 1.5rem; color: #596579; }
+button { border: 0; border-radius: 8px; background: #0077b6; color: white; padding: .8rem 1rem; cursor: pointer; }

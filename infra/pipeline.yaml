@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: GitHub CodePipeline and CodeBuild deployment for the CloudWatch RUM demo.
+Parameters:
+  GitHubConnectionArn:
+    Type: String
+    Description: ARN of an authorized AWS CodeStar connection for GitHub.
+  GitHubOwner:
+    Type: String
+  GitHubRepository:
+    Type: String
+  GitHubBranch:
+    Type: String
+    Default: main
+  ApplicationStackName:
+    Type: String
+    Default: cloudwatch-rum-demo
+Resources:
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      VersioningConfiguration: {Status: Enabled}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+
+  DeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: cloudformation.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: DeployRUMDemoResources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:CreateBucket, s3:DeleteBucket, s3:PutBucketPublicAccessBlock, s3:PutBucketOwnershipControls, s3:PutEncryptionConfiguration, s3:PutBucketPolicy, s3:DeleteBucketPolicy, s3:ListBucket, s3:PutObject, s3:GetObject, s3:DeleteObject, s3:GetBucketLocation, s3:GetBucketPolicy, s3:GetBucketPublicAccessBlock, s3:GetBucketOwnershipControls]
+                Resource: '*'
+              - Effect: Allow
+                Action: [cloudfront:CreateOriginAccessControl, cloudfront:UpdateOriginAccessControl, cloudfront:DeleteOriginAccessControl, cloudfront:GetOriginAccessControl, cloudfront:CreateDistribution, cloudfront:UpdateDistribution, cloudfront:DeleteDistribution, cloudfront:GetDistribution, cloudfront:GetDistributionConfig]
+                Resource: '*'
+              - Effect: Allow
+                Action: [rum:CreateAppMonitor, rum:UpdateAppMonitor, rum:DeleteAppMonitor, rum:GetAppMonitor, rum:TagResource, rum:UntagResource]
+                Resource: '*'
+              - Effect: Allow
+                Action: [cognito-identity:CreateIdentityPool, cognito-identity:UpdateIdentityPool, cognito-identity:DeleteIdentityPool, cognito-identity:SetIdentityPoolRoles, cognito-identity:GetIdentityPoolRoles]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ssm:PutParameter, ssm:DeleteParameter, ssm:GetParameter]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cloudwatch-rum-demo/${ApplicationStackName}/app-monitor-id'
+              - Effect: Allow
+                Action: [lambda:CreateFunction, lambda:UpdateFunctionCode, lambda:UpdateFunctionConfiguration, lambda:DeleteFunction, lambda:GetFunction, lambda:AddPermission, lambda:RemovePermission, lambda:InvokeFunction, lambda:TagResource, lambda:UntagResource]
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApplicationStackName}-site-publisher'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogGroups, logs:DeleteLogGroup, logs:PutRetentionPolicy]
+                Resource: '*'
+              - Effect: Allow
+                Action: [iam:CreateRole, iam:DeleteRole, iam:PutRolePolicy, iam:DeleteRolePolicy, iam:AttachRolePolicy, iam:DetachRolePolicy, iam:GetRole, iam:GetRolePolicy, iam:PassRole, iam:TagRole, iam:UntagRole, iam:ListRolePolicies, iam:ListAttachedRolePolicies]
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationStackName}-*'
+              - Effect: Allow
+                Action: [iam:CreateServiceLinkedRole]
+                Resource: '*'
+                Condition: {StringEquals: {iam:AWSServiceName: rum.amazonaws.com}}
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: BuildAndCallCloudFormation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:AbortMultipartUpload, s3:ListBucket]
+                Resource: [!GetAtt PipelineArtifactBucket.Arn, !Sub '${PipelineArtifactBucket.Arn}/*']
+              - Effect: Allow
+                Action: [cloudformation:CreateChangeSet, cloudformation:DescribeChangeSet, cloudformation:ExecuteChangeSet, cloudformation:DeleteChangeSet, cloudformation:DescribeStacks, cloudformation:DescribeStackEvents, cloudformation:GetTemplate]
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt DeploymentRole.Arn
+                Condition: {StringEquals: {iam:PassedToService: cloudformation.amazonaws.com}}
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${AWS::StackName}-deploy'
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: {Type: CODEPIPELINE}
+      Source: {Type: CODEPIPELINE, BuildSpec: buildspec.yml}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - {Name: ARTIFACT_BUCKET, Value: !Ref PipelineArtifactBucket}
+          - {Name: APPLICATION_STACK_NAME, Value: !Ref ApplicationStackName}
+          - {Name: DEPLOYMENT_ROLE_ARN, Value: !GetAtt DeploymentRole.Arn}
+      TimeoutInMinutes: 30
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: codepipeline.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: RunBuildPipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetBucketVersioning, s3:GetBucketAcl, s3:GetBucketLocation, s3:PutObject, s3:GetObject, s3:GetObjectVersion]
+                Resource: [!GetAtt PipelineArtifactBucket.Arn, !Sub '${PipelineArtifactBucket.Arn}/*']
+              - Effect: Allow
+                Action: [codebuild:BatchGetBuilds, codebuild:StartBuild]
+                Resource: !GetAtt BuildProject.Arn
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !Ref GitHubConnectionArn
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${AWS::StackName}-github-deploy'
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore: {Type: S3, Location: !Ref PipelineArtifactBucket}
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId: {Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: '1'}
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepository}'
+                BranchName: !Ref GitHubBranch
+                DetectChanges: 'true'
+              OutputArtifacts: [{Name: SourceOutput}]
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: PackageAndDeploy
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: '1'}
+              Configuration: {ProjectName: !Ref BuildProject}
+              InputArtifacts: [{Name: SourceOutput}]
+              RunOrder: 1
+
+Outputs:
+  PipelineName: {Value: !Ref Pipeline}
+  PipelineArtifactBucket: {Value: !Ref PipelineArtifactBucket}
+  ApplicationStackName: {Value: !Ref ApplicationStackName}
